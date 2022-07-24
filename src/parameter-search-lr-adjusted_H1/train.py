@@ -552,7 +552,50 @@ def train_gradient(img_df, img_dir, model):
     df['label_1'] = label_1s
     df['prob_1'] = prob_1s
     df['expected_gradient'] = (df['label_1'] * df['prob_1']) + (df['label_0'] * (1-df['prob_1']))
-    return df       
+    return df 
+
+def eval_loss_decrease(img_df, img_dir, model, n):
+    # load predict loss decrease model
+    model = new_resnet50()
+    model.load_state_dict(torch.load('Mymodel2.pt')) # model directory needs to be set mannually
+    model = model.cuda()
+    model.eval()
+
+    dataset = ProtestDataset_AL(img_dir=img_dir, img_df=img_df)
+    data_loader = DataLoader(dataset,
+                             num_workers=args.workers,
+                             batch_size=args.batch_size)
+
+    outputs = []
+    imgpaths = []
+
+    n_imgs = len(img_df.iloc[:, 0])
+    with tqdm(total=n_imgs) as pbar:
+        for i, sample in enumerate(data_loader):
+            imgpath, input = sample['imgpath'], sample['image']
+            if args.cuda:
+                input = input.cuda()
+
+            input_var = Variable(input)
+            output = model(input_var)
+            outputs.append(output.cpu().data.numpy())
+            imgpaths += imgpath
+            if i < n_imgs / args.batch_size:
+                pbar.update(args.batch_size)
+            else:
+                pbar.update(n_imgs % args.batch_size)
+
+    df = pd.DataFrame(np.zeros((n_imgs, 2)))
+    df.columns = ["imgpath", "loss_decrease"]
+    df['imgpath'] = imgpaths
+    df.iloc[:, 1] = np.concatenate(outputs)
+    df.sort_values(by='imgpath', inplace=True)
+    #df['protest_close'] = np.abs(df['protest'] - 0.5)
+    df_close = df.nsmallest(n, 'loss_decrease')
+    img_df_cp = img_df.copy()
+    img_df_cp['imgpath'] = img_df_cp.iloc[:, 0].apply(lambda x: os.path.join(img_dir, x))
+    img_df_cp = img_df_cp[img_df_cp['imgpath'].isin(df_close['imgpath'])]
+    return img_df_cp.drop('imgpath', axis=1)
 
 def adjust_learning_rate_reset(optimizer, epoch):
     """Sets the learning rate to the initial LR decayed by 0.5 every epoch for every 5 epochs"""
@@ -757,7 +800,10 @@ def main():
     elif args.heuristic_id == 3:
         heuristic_func = eval_one_similarity
         pass
-
+    
+    elif args.heuristic_id == 4:
+        heuristic_func = eval_loss_decrease
+        
     else:
         heuristic_func = None
         
