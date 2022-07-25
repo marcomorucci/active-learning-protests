@@ -44,6 +44,40 @@ class ProtestDataset(Dataset):
             sample["image"] = self.transform(sample["image"])
         return sample
 
+# dataset class for loss decrease
+class ProtestDatasetLossTrain(Dataset):
+    """
+    dataset for loss_decrease training
+    """
+    def __init__(self, df_imgs, img_dir, transform=None, loss_decrease=0):
+        """
+        Args:
+            df_imgs: Data Frame containing image name and label
+            img_dir: Directory with images
+            transform: Optional transform to be applied on a sample.
+        """
+        self.label_frame = df_imgs
+        self.img_dir = img_dir
+        self.transform = transform
+        self.loss = loss_decrease
+    def __len__(self):
+        return len(self.label_frame)
+    def __getitem__(self, idx):
+        imgpath = os.path.join(self.img_dir, self.label_frame.iloc[idx,0])
+        image = pil_loader(imgpath)
+
+        protest = self.label_frame.iloc[idx, 1:2].to_numpy().astype('float')
+        violence = self.label_frame.iloc[idx, 2:3].to_numpy().astype('float')
+        visattr = self.label_frame.iloc[idx, 3:].to_numpy().astype('float')
+        label = {'protest':protest, 'violence':violence, 'visattr':visattr}
+        l_h = self.loss
+
+        sample = {"image":image, "label":label, "fname":self.label_frame.iloc[idx, 0], "path":imgpath, "loss":l_h}
+        #sample = {"image":image, "fname":self.label_frame.iloc[idx, 0], "loss":l_h}
+        if self.transform:
+            sample["image"] = self.transform(sample["image"])
+        return sample
+
 class ProtestDatasetEval(Dataset):
     """
     dataset for just calculating the output (does not need an annotation file)
@@ -137,6 +171,25 @@ def modified_resnet50():
 
 
     return model
+
+class NewFinalLayer(nn.Module):
+    """modified last layer for resnet50 for our dataset"""
+    def __init__(self,features=100,out=1):
+        super(FinalLayer, self).__init__()
+        self.fc = nn.Linear(2048, features)
+        self.sigmoid = nn.Sigmoid()
+        self.fc2 = nn.Linear(features,out)
+
+    def forward(self, x):
+        out = self.fc(x)
+        out = self.sigmoid(out)
+        out = self.fc2(out)
+        return out
+   
+def new_resnet50(features=100, out=1, finetune=True):
+    # load pretrained resnet50 with a modified last fully connected layer
+    model = models.resnet50(pretrained = finetune)
+    model.fc = NewFinalLayer(features,out)
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
