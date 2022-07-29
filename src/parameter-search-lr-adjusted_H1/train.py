@@ -25,7 +25,7 @@ from torch.autograd import Variable
 import torchvision.transforms as transforms
 import torchvision.models as models
 
-from util import ProtestDataset, modified_resnet50, AverageMeter, Lighting,ProtestDataset_AL
+from util import ProtestDataset, ProtestDatasetLossTrain, modified_resnet50, new_resnet50, AverageMeter, Lighting, ProtestDataset_AL
 #from pred import eval_one_data
 
 # for indexing output of the model
@@ -94,6 +94,93 @@ def calculate_loss(output, target, criterions, weights = [1, 10, 5]):
 
 
 
+def trainloss(dataset, imglist, train_loader, model, criterions, optimizer, epoch):
+    """training the model"""
+
+    model.train()
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    loss_protest = AverageMeter()
+    loss_v = AverageMeter()
+    protest_acc = AverageMeter()
+    violence_mse = AverageMeter()
+    visattr_acc = AverageMeter()
+
+    end = time.time()
+    loss_history = []
+    lh_decrease = []
+    for i, sample in enumerate(train_loader):
+        # measure data loading batch_time
+        input, target = sample['image'], sample['label']
+        data_time.update(time.time() - end)
+
+        if args.cuda:
+            input = input.cuda()
+            for k, v in target.items():
+                target[k] = v.cuda()
+        target_var = {}
+        for k,v in target.items():
+            target_var[k] = Variable(v)
+
+        input_var = Variable(input)
+        output = model(input_var)
+
+        losses, scores, N_protest = calculate_loss(output, target_var, criterions)
+
+        optimizer.zero_grad()
+        loss = 0
+        for l in losses:
+            loss += l
+        # back prop
+        loss.backward()
+        optimizer.step()
+
+        output_new = model(input_var)
+
+        losses_new, scores_new, N_protest_new = calculate_loss(output_new, target_var, criterions)
+        loss_new = 0
+        for l in losses_new:
+            loss_new += l
+        l_decrease = loss_new - loss
+        lh_decrease.append(float(l_decrease))  # float(l_decrease) to save cuda memory
+        for x in sample['path']:
+            imglist[0].append(x)
+            imglist[1].append(float(l_decrease))
+        print(f"model loss decrease new heuristics function: {l_decrease}")
+
+        if N_protest:
+            loss_protest.update(losses[0].data, input.size(0))
+            loss_v.update(loss.data - losses[0].data, N_protest)
+        else:
+            # when there is no protest image in the batch
+            loss_protest.update(losses[0].data, input.size(0))
+        loss_history.append(loss.data)
+        protest_acc.update(scores['protest_acc'], input.size(0))
+        violence_mse.update(scores['violence_mse'], N_protest)
+        visattr_acc.update(scores['visattr_acc'], N_protest)
+
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            print('Epoch: [{0}][{1}/{2}] '
+                  'Time {batch_time.val:.2f} ({batch_time.avg:.2f})  '
+                  'Data {data_time.val:.2f} ({data_time.avg:.2f})  '
+                  'Loss {loss_val:.3f} ({loss_avg:.3f})  '
+                  'Protest {protest_acc.val:.3f} ({protest_acc.avg:.3f})  '
+                  'Violence {violence_mse.val:.5f} ({violence_mse.avg:.5f})  '
+                  'Vis Attr {visattr_acc.val:.3f} ({visattr_acc.avg:.3f})'
+                  .format(
+                   epoch, i, len(train_loader), batch_time=batch_time,
+                   data_time=data_time,
+                   loss_val=loss_protest.val + loss_v.val,
+                   loss_avg = loss_protest.avg + loss_v.avg,
+                   protest_acc = protest_acc, violence_mse = violence_mse,
+                   visattr_acc = visattr_acc))
+
+    return loss_history, lh_decrease
+
 def train(train_loader, model, criterions, optimizer, epoch):
     """training the model"""
 
@@ -139,7 +226,6 @@ def train(train_loader, model, criterions, optimizer, epoch):
             loss_protest.update(losses[0].data, input.size(0))
             loss_v.update(loss.data - losses[0].data, N_protest)
         else:
-            # when there is no protest image in the batch
             loss_protest.update(losses[0].data, input.size(0))
         loss_history.append(loss.data)
         protest_acc.update(scores['protest_acc'], input.size(0))
@@ -160,7 +246,7 @@ def train(train_loader, model, criterions, optimizer, epoch):
                   .format(
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time,
-                   loss_val=loss_protest.val + loss_v.val,
+                   loss_val=loss_protest.val + loss_v.val, 
                    loss_avg = loss_protest.avg + loss_v.avg,
                    protest_acc = protest_acc, violence_mse = violence_mse,
                    visattr_acc = visattr_acc))
@@ -237,9 +323,17 @@ def validate(val_loader, model, criterions, epoch):
                   violence_mse = violence_mse, visattr_acc = visattr_acc))
     return loss_protest.avg + loss_v.avg, loss_history
 
-def adjust_learning_rate(optimizer, epoch):
+def adjust_learning_rate(optimizer, epoch, mode=1):
     """Sets the learning rate to the initial LR decayed by 0.5 every 5 epochs"""
-    lr = args.lr * (0.4 ** (epoch // 4))
+    if mode == 0:
+        lr = args.lr
+    elif mode == 1:
+        lr = args.lr * (0.4 ** (epoch // 4))
+    elif mode == 2:
+        lr = args.lr * (0.5 ** (epoch // 20))
+    elif mode == 3:
+        ##TODO:cyclic_lr
+        pass
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
         
@@ -552,12 +646,12 @@ def train_gradient(img_df, img_dir, model):
     df['label_1'] = label_1s
     df['prob_1'] = prob_1s
     df['expected_gradient'] = (df['label_1'] * df['prob_1']) + (df['label_0'] * (1-df['prob_1']))
-    return df 
+    return df       
 
 def eval_loss_decrease(img_df, img_dir, model, n):
     # load predict loss decrease model
     model = new_resnet50()
-    model.load_state_dict(torch.load('Mymodel2.pt')) # model directory needs to be set mannually
+    model.load_state_dict(torch.load(args.loss_decrease_model))
     model = model.cuda()
     model.eval()
 
@@ -585,7 +679,7 @@ def eval_loss_decrease(img_df, img_dir, model, n):
             else:
                 pbar.update(n_imgs % args.batch_size)
 
-    df = pd.DataFrame(np.zeros((n_imgs, 2)))
+    df  = pd.DataFrame(np.zeros((n_imgs, 2)))
     df.columns = ["imgpath", "loss_decrease"]
     df['imgpath'] = imgpaths
     df.iloc[:, 1] = np.concatenate(outputs)
@@ -597,9 +691,57 @@ def eval_loss_decrease(img_df, img_dir, model, n):
     img_df_cp = img_df_cp[img_df_cp['imgpath'].isin(df_close['imgpath'])]
     return img_df_cp.drop('imgpath', axis=1)
 
+def eval_loss_decrease_by_epoch(img_df, img_dir, model, n, epoch):
+    # load predict loss decrease model
+    model = new_resnet50(out=100)
+    model.load_state_dict(torch.load(args.loss_decrease_model))
+    model = model.cuda()
+    model.eval()
+
+    dataset = ProtestDataset_AL(img_dir=img_dir, img_df=img_df)
+    data_loader = DataLoader(dataset,
+                             num_workers=args.workers,
+                             batch_size=10)
+
+    outputs = []
+    imgpaths = []
+
+    n_imgs = len(img_df.iloc[:, 0])
+    with tqdm(total=n_imgs) as pbar:
+        for i, sample in enumerate(data_loader):
+            imgpath, input = sample['imgpath'], sample['image']
+            if args.cuda:
+                input = input.cuda()
+  
+            input_var = Variable(input)
+            output = model(input_var)
+            outputs.append(output.cpu().data.numpy())
+            imgpaths += imgpath
+            if i < n_imgs / args.batch_size:
+                pbar.update(args.batch_size)
+            else:
+                pbar.update(n_imgs % args.batch_size)
+
+    df  = pd.DataFrame(np.zeros((n_imgs, 101)))
+    df.columns = ["imgpath"] + [i for i in range(100)]
+    df['imgpath'] = imgpaths
+    df.iloc[:, 1:] = np.concatenate(outputs)
+    df.sort_values(by='imgpath', inplace=True)
+    #df['protest_close'] = np.abs(df['protest'] - 0.5)
+    df_close = df.nsmallest(n, epoch)
+    img_df_cp = img_df.copy()
+    img_df_cp['imgpath'] = img_df_cp.iloc[:, 0].apply(lambda x: os.path.join(img_dir, x))
+    img_df_cp = img_df_cp[img_df_cp['imgpath'].isin(df_close['imgpath'])]
+    return img_df_cp.drop('imgpath', axis=1)
+
+def eval_mix(img_df, img_dir, model, n, epoch, N=100):
+    al_image_first = eval_one_data(img_df,img_dir,model,N)
+    al_image = eval_loss_decrease_by_epoch(al_image_first,img_dir,model,n,epoch)
+    return al_image
+ 
 def adjust_learning_rate_reset(optimizer, epoch):
     """Sets the learning rate to the initial LR decayed by 0.5 every epoch for every 5 epochs"""
-
+ 
     lr = args.lr * (0.5 ** (epoch % 5))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -667,16 +809,15 @@ def learning_method(method_id=0,optimizer=None, heuristic_func=None, param1=None
         else:
             al_image = None
             adjust_learning_rate(optimizer,epoch-120)
-
+    
 
     else:
         #Baseline learning method. Add an image every epoch and adjust lr everytime
-        adjust_learning_rate(optimizer,epoch)
+        adjust_learning_rate(optimizer,epoch, args.lr_mode)
         if heuristic_func:
-            al_image = heuristic_func(param1,param2,param3, param4)
+            al_image = heuristic_func(param1,param2,param3,param4,epoch)
         else:
             al_image = param1.sample(param4)
-
 
 
 
@@ -800,9 +941,16 @@ def main():
     elif args.heuristic_id == 3:
         heuristic_func = eval_one_similarity
         pass
-    
+
     elif args.heuristic_id == 4:
         heuristic_func = eval_loss_decrease
+        pass
+
+    elif args.heuristic_id == 5:
+        heuristic_func = eval_loss_decrease_by_epoch
+    
+    elif args.heuristic_id == 6:
+        heuristic_func = eval_mix
         
     else:
         heuristic_func = None
@@ -837,10 +985,8 @@ def main():
         print(len(txt_file_train_l),len(txt_file_train_nl),len(txt_file_train))
 
         #adjust_learning_rate(optimizer, epoch)
-        loss_history_train_this = train(train_loader, model, criterions,
-                                        optimizer, epoch)
-        loss_val, loss_history_val_this = validate(val_loader, model,
-                                                   criterions, epoch)
+        loss_history_train_this = train(train_loader, model, criterions,optimizer, epoch)
+        loss_val, loss_history_val_this = validate(val_loader, model,criterions, epoch)
         loss_history_train.append(loss_history_train_this)
         loss_history_val.append(loss_history_val_this)
 
@@ -866,10 +1012,11 @@ def main():
 
        
 
-            
+        #if args.heuristic_id >= 5:
         #if heuristic_func:
         al_image = learning_method(args.method_id,optimizer,heuristic_func,txt_file_train_nl,img_dir_train, model, n, epoch)
-
+        #print(txt_file_train_nl.shape,al_image.shape)
+        #print(txt_file_train_nl,al_image)
         # else:
         #     al_image = txt_file_train_nl.sample(1)
         #     adjust_learning_rate(optimizer, epoch)
@@ -959,6 +1106,15 @@ if __name__ == "__main__":
                         change learning rate when resuming")
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
+
+    parser.add_argument('--loss_decrease_model',
+                        default='MyModel.pt', type=str, 
+                        help='name of the loss_decrease model to be loaded')
+    parser.add_argument("--lr_mode",
+                        type = int,
+                        default = 1,
+                        help = "Which lr adjust method to use for AL",
+                        )
     args = parser.parse_args()
 
     if args.cuda:
